@@ -8,75 +8,88 @@
 #include <termios.h>
 #include <string.h>
 
-// Definições para a placa DE2i-150
+// Configurações da placa DE2i-150
 #define DEVICE_FILE "/dev/de2i150_altera"
 #define WR_R_DISPLAY 0x00000004
 #define WR_RED_LEDS 0x00000005
 #define WR_GREEN_LEDS 0x00000006
+#define RD_PBUTTONS 0x00000002
 
 // Configurações do jogo
 #define WIDTH 4
 #define HEIGHT 10
-#define NOTE_DELAY 200000 // 200ms
+#define NOTE_DELAY 150000
 #define MAX_MISSES 3
+#define NOTE_SPAWN_RATE 15
 
 // Variáveis globais
 int score = 0;
 int consecutive_misses = 0;
-bool game_over = false;
+bool game_active = true;
 int dev_fd;
 struct termios original_termios;
 
-// Função para configurar o terminal
+// Inicialização do terminal
 void init_terminal() {
-    struct termios new_termios;
-    
     tcgetattr(STDIN_FILENO, &original_termios);
-    new_termios = original_termios;
+    struct termios new_termios = original_termios;
     
     new_termios.c_lflag &= ~(ICANON | ECHO);
-    new_termios.c_cc[VMIN] = 1;
+    new_termios.c_cc[VMIN] = 0;
     new_termios.c_cc[VTIME] = 0;
     
     tcsetattr(STDIN_FILENO, TCSANOW, &new_termios);
     
-    printf("\033[?25l"); // Esconde cursor
-    printf("\033[2J");   // Limpa tela
+    printf("\033[?25l\033[2J\033[H");
 }
 
 void restore_terminal() {
     tcsetattr(STDIN_FILENO, TCSANOW, &original_termios);
-    printf("\033[?25h"); // Mostra cursor
+    printf("\033[?25h\033[2J\033[H");
 }
 
+// Controle de hardware
 void write_hw(int command, unsigned long value) {
     ioctl(dev_fd, command, value);
 }
 
+unsigned long read_hw(int command) {
+    unsigned long value = 0;
+    ioctl(dev_fd, command, &value);
+    return value;
+}
+
+// Estrutura do jogo
 typedef struct {
-    int type; // 1-4
-    int y;    // posição vertical
+    int column;
+    int position;
     bool active;
 } Note;
 
-void generate_note(Note *notes, int *note_count) {
-    if (*note_count < WIDTH * HEIGHT) {
-        notes[*note_count].type = rand() % 4 + 1;
-        notes[*note_count].y = 0;
-        notes[*note_count].active = true;
-        (*note_count)++;
+Note notes[WIDTH * HEIGHT * 2];
+int note_count = 0;
+
+// Geração de notas
+void spawn_note() {
+    if (note_count < WIDTH * HEIGHT * 2) {
+        notes[note_count].column = rand() % WIDTH;
+        notes[note_count].position = 0;
+        notes[note_count].active = true;
+        note_count++;
     }
 }
 
-void update_notes(Note *notes, int note_count) {
+// Atualização do jogo
+void update_game() {
+    // Movimenta as notas
     for (int i = 0; i < note_count; i++) {
         if (notes[i].active) {
-            notes[i].y++;
-            if (notes[i].y >= HEIGHT) {
+            notes[i].position++;
+            if (notes[i].position >= HEIGHT) {
                 notes[i].active = false;
                 consecutive_misses++;
                 if (consecutive_misses >= MAX_MISSES) {
-                    game_over = true;
+                    game_active = false;
                     write_hw(WR_RED_LEDS, 0xFF);
                 }
             }
@@ -84,78 +97,100 @@ void update_notes(Note *notes, int note_count) {
     }
 }
 
-void draw_screen(Note *notes, int note_count) {
-    char screen[HEIGHT][WIDTH];
-    memset(screen, '.', sizeof(screen));
-
-    // Preenche as notas ativas
+// Renderização do jogo
+void render_game() {
+    char screen[HEIGHT][WIDTH+1];
+    
+    // Inicializa a tela
+    for (int y = 0; y < HEIGHT; y++) {
+        for (int x = 0; x < WIDTH; x++) {
+            screen[y][x] = '.';
+        }
+        screen[y][WIDTH] = '\0';
+    }
+    
+    // Coloca as notas na tela
     for (int i = 0; i < note_count; i++) {
         if (notes[i].active) {
-            int col = notes[i].type - 1;
-            if (col >= 0 && col < WIDTH && notes[i].y < HEIGHT) {
-                screen[notes[i].y][col] = '0' + notes[i].type;
+            int y = notes[i].position;
+            int x = notes[i].column;
+            if (y >= 0 && y < HEIGHT && x >= 0 && x < WIDTH) {
+                screen[y][x] = '1' + x;
             }
         }
     }
-
-    printf("\033[H"); // Move cursor para o início
     
     // Desenha a tela
+    printf("\033[H");
     for (int y = 0; y < HEIGHT; y++) {
-        for (int x = 0; x < WIDTH; x++) {
-            printf("%c ", screen[y][x]);
-        }
-        printf("\n");
+        printf("%s\n", screen[y]);
     }
     
     // Linha de base
-    for (int i = 0; i < WIDTH; i++) printf("--");
+    for (int x = 0; x < WIDTH; x++) printf("--");
     printf("\n");
     
     printf("Score: %d | Erros: %d/%d\n", score, consecutive_misses, MAX_MISSES);
-    if (game_over) printf("GAME OVER! Pressione CTRL+C para sair.\n");
+    
+    if (!game_active) {
+        printf("\n\033[31mGAME OVER! Pontuacao final: %d\033[0m\n", score);
+    }
 }
 
-void check_hit(int button, Note *notes, int note_count) {
-    bool hit = false;
+// Verificação de acertos
+void check_input() {
+    static unsigned long prev_buttons = 0;
+    unsigned long buttons = read_hw(RD_PBUTTONS);
+    unsigned long changes = buttons ^ prev_buttons;
     
-    for (int i = 0; i < note_count; i++) {
-        if (notes[i].active && notes[i].y == HEIGHT-1 && notes[i].type == button) {
-            notes[i].active = false;
-            score += 10;
-            consecutive_misses = 0;
-            hit = true;
-            
-            write_hw(WR_GREEN_LEDS, 1 << (button-1));
-            usleep(100000);
-            write_hw(WR_GREEN_LEDS, 0);
-            break;
+    for (int btn = 0; btn < WIDTH; btn++) {
+        if (changes & (1 << btn)) {
+            if (buttons & (1 << btn)) {
+                // Botão pressionado
+                bool hit = false;
+                
+                for (int i = 0; i < note_count; i++) {
+                    if (notes[i].active && notes[i].position == HEIGHT-1 && notes[i].column == btn) {
+                        notes[i].active = false;
+                        score += 10;
+                        consecutive_misses = 0;
+                        hit = true;
+                        
+                        write_hw(WR_GREEN_LEDS, 1 << btn);
+                        usleep(50000);
+                        write_hw(WR_GREEN_LEDS, 0);
+                        break;
+                    }
+                }
+                
+                if (!hit) {
+                    consecutive_misses++;
+                    write_hw(WR_RED_LEDS, 1 << btn);
+                    usleep(50000);
+                    write_hw(WR_RED_LEDS, 0);
+                    
+                    if (consecutive_misses >= MAX_MISSES) {
+                        game_active = false;
+                        write_hw(WR_RED_LEDS, 0xFF);
+                    }
+                }
+                
+                write_hw(WR_R_DISPLAY, score);
+            }
         }
     }
     
-    if (!hit && button != 0) {
-        consecutive_misses++;
-        
-        write_hw(WR_RED_LEDS, 1 << (button-1));
-        usleep(100000);
-        write_hw(WR_RED_LEDS, 0);
-        
-        if (consecutive_misses >= MAX_MISSES) {
-            game_over = true;
-            write_hw(WR_RED_LEDS, 0xFF);
-        }
-    }
-    
-    write_hw(WR_R_DISPLAY, score);
+    prev_buttons = buttons;
 }
 
 int main() {
     srand(time(NULL));
     init_terminal();
     
+    // Inicializa hardware
     dev_fd = open(DEVICE_FILE, O_RDWR);
     if (dev_fd < 0) {
-        perror("Erro ao abrir dispositivo");
+        perror("Falha ao abrir dispositivo");
         restore_terminal();
         return 1;
     }
@@ -164,35 +199,28 @@ int main() {
     write_hw(WR_RED_LEDS, 0);
     write_hw(WR_GREEN_LEDS, 0);
     
-    Note notes[WIDTH * HEIGHT] = {0};
-    int note_count = 0;
+    printf("Guitar Hero DE2i-150\n");
+    printf("Preparando...\n");
+    usleep(1000000);
+    
     int frame = 0;
-    
-    printf("Jogo Guitar Hero - DE2i-150\n");
-    printf("Use os botões 1-4 para jogar\n");
-    usleep(1000000); // Pausa para ler as instruções
-    
-    while (!game_over) {
-        if (frame % 10 == 0) {
-            generate_note(notes, &note_count);
+    while (game_active) {
+        // Gera novas notas
+        if (frame % NOTE_SPAWN_RATE == 0) {
+            spawn_note();
         }
         
-        update_notes(notes, note_count);
-        draw_screen(notes, note_count);
-        
-        char input = 0;
-        if (read(STDIN_FILENO, &input, 1) > 0) {
-            if (input >= '1' && input <= '4') {
-                check_hit(input - '0', notes, note_count);
-            }
-        }
+        update_game();
+        render_game();
+        check_input();
         
         usleep(NOTE_DELAY);
         frame++;
     }
     
+    // Tela de game over
     while (1) {
-        draw_screen(notes, note_count);
+        render_game();
         usleep(100000);
     }
     
