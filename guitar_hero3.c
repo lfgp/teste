@@ -40,6 +40,12 @@ void write_hw(int command, unsigned long value) {
     }
 }
 
+// Configuração do terminal
+void init_terminal() {
+    printf("\033[?25l"); // Esconde o cursor
+    printf("\033[2J");   // Limpa a tela
+}
+
 // Estrutura para representar uma nota
 typedef struct {
     int type;
